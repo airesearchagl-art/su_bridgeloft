@@ -7,21 +7,43 @@
 # 選択し、指定した分割数（steps）でその間を「形状補間」しながら埋めるツール。
 #
 # [Development Phases]
-# Phase 1: 選択オブジェクトからの頂点データ（ワールド座標系）の抽出  ← 現在
-# Phase 2: 頂点数が異なる場合の対応付け（マッピング/リサンプリング）ロジック
+# Phase 1: 選択オブジェクトからの頂点データ（ワールド座標系）の抽出         [完了]
+# Phase 2: 頂点数が異なる場合の対応付け（マッピング/リサンプリング）ロジック ← 現在
 # Phase 3: 補間（Tweening）による中間ジオメトリの生成とEntitiesへの描画
 # Phase 4: UI（入力ボックス）の実装とUndo管理（start_operation）の統合
 #
-# [Usage - Phase 1]
+# [Phase 2 Algorithm Overview]
+# Step 1 - Angular Sort:
+#   Newell法で点群の法線を推定し、重心まわりの角度で頂点を時計回りに整列する。
+#   これにより、頂点順序の不整合から生じるLoftの「ねじれ」を抑制する。
+#
+# Step 2 - Arc-length Resampling:
+#   頂点数が少ない側の閉ループを周長沿いに均等補間し、多い側の頂点数に揃える。
+#   これにより、形状が異なる2つのシルエットを同じ頂点数で比較できるようにする。
+#
+# Step 3 - Rotation Alignment:
+#   B配列の循環シフト（回転オフセット）を全パターン試し、A との距離コストの
+#   合計が最小になるシフト量を採用する。これがLoftの「開始点」を揃える役割を担う。
+#
+# [Usage - Phase 2]
 # 1. SketchUp で2つの ComponentInstance を選択する
-# 2. Ruby コンソールで以下を実行:
+# 2. Ruby コンソールで:
 #      load '/path/to/su_bridgeloft.rb'
 #    または
-#      SuBridgeLoft::Phase1.extract_vertices
+#      SuBridgeLoft::Phase2.run
+#    または、直接頂点配列を渡す場合:
+#      pairs = SuBridgeLoft::Phase2.map_vertices(pts_a, pts_b)
 #
 # =============================================================================
 
 module SuBridgeLoft
+
+  # SketchUp内部単位(inches)での幾何的同一判定しきい値 — 全フェーズ共有
+  TOLERANCE = 1.0e-6
+
+  # ===========================================================================
+  # Phase 1: ワールド座標系への頂点抽出
+  # ===========================================================================
   module Phase1
 
     # 選択中の2つのComponentInstanceから頂点をワールド座標で抽出し、コンソールに出力する
@@ -67,10 +89,9 @@ module SuBridgeLoft
       end
 
       puts ""
-      puts "==========================================================
-"
+      puts "=========================================================="
+      puts ""
 
-      # 呼び出し元でも使えるよう結果を返す
       { comp_a: vertices_a, comp_b: vertices_b }
     end
 
@@ -81,11 +102,7 @@ module SuBridgeLoft
     def self.world_vertices(instance)
       transform = instance.transformation
       vertices  = []
-
-      # Definition 内のエンティティを再帰的に走査し、Edge の端点（Vertex）を収集
       collect_vertices(instance.definition.entities, transform, vertices)
-
-      # 重複頂点を除去（同一座標を持つ Vertex は1つにまとめる）
       unique_vertices(vertices)
     end
 
@@ -98,18 +115,15 @@ module SuBridgeLoft
       entities.each do |entity|
         case entity
         when Sketchup::Edge
-          # Edge の両端点をワールド座標に変換して追加
           out << entity.start.position.transform(transform)
           out << entity.end.position.transform(transform)
 
         when Sketchup::Face
-          # Face のループから頂点を取得（Edge との重複は後段の unique_vertices で解消）
           entity.outer_loop.vertices.each do |v|
             out << v.position.transform(transform)
           end
 
         when Sketchup::ComponentInstance, Sketchup::Group
-          # ネストした ComponentInstance / Group は変換を累積して再帰
           child_transform = transform * entity.transformation
           child_entities  = entity.is_a?(Sketchup::Group) ?
                             entity.entities :
@@ -119,27 +133,334 @@ module SuBridgeLoft
       end
     end
 
-    # 同一座標（SketchUp の内部単位 inches で比較）の頂点を除去する
-    #
-    # @param points [Array<Geom::Point3d>]
-    # @return [Array<Geom::Point3d>]
-    TOLERANCE = 1.0e-6  # inches
-
+    # 同一座標（TOLERANCE以内）の頂点を除去する
     def self.unique_vertices(points)
       result = []
       points.each do |pt|
-        duplicate = result.any? do |r|
-          (r.x - pt.x).abs < TOLERANCE &&
-          (r.y - pt.y).abs < TOLERANCE &&
-          (r.z - pt.z).abs < TOLERANCE
-        end
-        result << pt unless duplicate
+        next if result.any? { |r|
+          (r.x.to_f - pt.x.to_f).abs < TOLERANCE &&
+          (r.y.to_f - pt.y.to_f).abs < TOLERANCE &&
+          (r.z.to_f - pt.z.to_f).abs < TOLERANCE
+        }
+        result << pt
       end
       result
     end
 
   end # module Phase1
+
+
+  # ===========================================================================
+  # Phase 2: 頂点マッピング（Angular Sort → Resample → Alignment）
+  # ===========================================================================
+  module Phase2
+
+    # -------------------------------------------------------------------------
+    # Public API
+    # -------------------------------------------------------------------------
+
+    # 選択から Phase1 のデータを取得し、マッピングを実行してログを出力する。
+    # Phase 1 → Phase 2 の一括実行エントリポイント。
+    #
+    # @return [Array<Hash{a: Geom::Point3d, b: Geom::Point3d}>] ペア配列
+    def self.run
+      data = Phase1.extract_vertices
+      return nil unless data
+
+      map_vertices(data[:comp_a], data[:comp_b])
+    end
+
+    # 2つの点群をマッピングしてペア配列を返す。
+    # ログ出力も行うため、コンソールでの動作確認に使用できる。
+    #
+    # @param pts_a [Array<Geom::Point3d>]
+    # @param pts_b [Array<Geom::Point3d>]
+    # @return [Array<Hash{a: Geom::Point3d, b: Geom::Point3d}>]
+    def self.map_vertices(pts_a, pts_b)
+      if pts_a.empty? || pts_b.empty?
+        puts "[BridgeLoft] Error: Empty vertex array passed to map_vertices."
+        return []
+      end
+
+      # Step 1: Angular Sort — 各点群を重心まわりの角度で整列
+      sorted_a = angular_sort(pts_a)
+      sorted_b = angular_sort(pts_b)
+
+      # Step 2: Arc-length Resample — 少ない方を多い方の頂点数に合わせる
+      target_n  = [sorted_a.length, sorted_b.length].max
+      rsmp_a    = resample(sorted_a, target_n)
+      rsmp_b    = resample(sorted_b, target_n)
+
+      # Step 3: Rotation Alignment — 距離コストが最小になる循環シフトを探す
+      offset    = best_alignment_offset(rsmp_a, rsmp_b)
+      aligned_b = rotate_array(rsmp_b, offset)
+
+      # ペア配列を生成してログ出力
+      pairs = rsmp_a.zip(aligned_b).map { |a, b| { a: a, b: b } }
+      log_pairs(pairs, pts_a.length, pts_b.length, target_n, offset)
+
+      pairs
+    end
+
+    # -------------------------------------------------------------------------
+    # Step 1: Angular Sort
+    # -------------------------------------------------------------------------
+
+    # 点群を重心まわりの角度（反時計回り）でソートして返す。
+    # Newell法で点群の最良適合平面法線を推定し、その平面への射影角でソート。
+    #
+    # @param points [Array<Geom::Point3d>]
+    # @return [Array<Geom::Point3d>]
+    def self.angular_sort(points)
+      return points.dup if points.length < 3
+
+      cen    = centroid(points)
+      normal = estimate_normal(points)
+
+      # u_axis: points[0] → 重心へのベクトルを平面に射影してローカルX軸とする
+      u_axis = projected_unit_vector(points[0] - cen, normal)
+
+      # u_axis が縮退した場合は別の点で試みる
+      if u_axis.nil?
+        fallback = points.find { |p| projected_unit_vector(p - cen, normal) }
+        return points.dup if fallback.nil?
+        u_axis = projected_unit_vector(fallback - cen, normal)
+      end
+
+      # v_axis: 法線 × u_axis = ローカルY軸（右手系）
+      v_axis = normal.cross(u_axis)
+
+      points.sort_by do |pt|
+        vec    = pt - cen
+        u_comp = dot3(vec, u_axis)
+        v_comp = dot3(vec, v_axis)
+        Math.atan2(v_comp, u_comp)
+      end
+    end
+
+    # Newell法で点群の最良適合平面法線（単位ベクトル）を推定する。
+    # 各連続辺のクロス積和を取るため、凸/非凸・3D点群のどちらにも有効。
+    #
+    # @param points [Array<Geom::Point3d>]
+    # @return [Geom::Vector3d] 正規化済み法線ベクトル
+    def self.estimate_normal(points)
+      n  = points.length
+      nx = 0.0; ny = 0.0; nz = 0.0
+
+      n.times do |i|
+        c = points[i]
+        e = points[(i + 1) % n]
+        # Newell's formula: 各辺から法線成分を累積
+        nx += (c.y.to_f - e.y.to_f) * (c.z.to_f + e.z.to_f)
+        ny += (c.z.to_f - e.z.to_f) * (c.x.to_f + e.x.to_f)
+        nz += (c.x.to_f - e.x.to_f) * (c.y.to_f + e.y.to_f)
+      end
+
+      len = Math.sqrt(nx * nx + ny * ny + nz * nz)
+      # 縮退した場合（点が一直線上など）はZ軸にフォールバック
+      return Geom::Vector3d.new(0, 0, 1) if len < 1e-10
+
+      Geom::Vector3d.new(nx / len, ny / len, nz / len)
+    end
+
+    # 点群の重心を返す
+    #
+    # @param points [Array<Geom::Point3d>]
+    # @return [Geom::Point3d]
+    def self.centroid(points)
+      n = points.length.to_f
+      Geom::Point3d.new(
+        points.sum { |p| p.x.to_f } / n,
+        points.sum { |p| p.y.to_f } / n,
+        points.sum { |p| p.z.to_f } / n
+      )
+    end
+
+    # ベクトル vec を平面（法線 normal）に射影して正規化する。
+    # 縮退（平面と平行）の場合は nil を返す。
+    #
+    # @param vec    [Geom::Vector3d]
+    # @param normal [Geom::Vector3d] 単位ベクトルであること
+    # @return [Geom::Vector3d, nil]
+    def self.projected_unit_vector(vec, normal)
+      n_comp = dot3(vec, normal)
+      proj   = Geom::Vector3d.new(
+        vec.x.to_f - n_comp * normal.x.to_f,
+        vec.y.to_f - n_comp * normal.y.to_f,
+        vec.z.to_f - n_comp * normal.z.to_f
+      )
+      len = proj.length.to_f
+      return nil if len < 1e-10
+      Geom::Vector3d.new(proj.x.to_f / len, proj.y.to_f / len, proj.z.to_f / len)
+    end
+
+    # 2つのベクトルのドット積（Float）を返す汎用ヘルパー
+    def self.dot3(a, b)
+      a.x.to_f * b.x.to_f +
+      a.y.to_f * b.y.to_f +
+      a.z.to_f * b.z.to_f
+    end
+
+    # -------------------------------------------------------------------------
+    # Step 2: Arc-length Resampling
+    # -------------------------------------------------------------------------
+
+    # 閉ループの点群を周長（arc-length）に沿って target_count 個に均等再サンプリングする。
+    # 元の点の位置は保持されず、周長上の等間隔位置を線形補間で求める。
+    #
+    # @param points       [Array<Geom::Point3d>]
+    # @param target_count [Integer]
+    # @return [Array<Geom::Point3d>]
+    def self.resample(points, target_count)
+      return points.dup if points.length == target_count
+
+      n = points.length
+      return Array.new(target_count, points[0]) if n < 2
+
+      # 各辺の長さと累積弧長を計算（閉ループ: 最後の点→先頭の点も含む）
+      seg_lengths = Array.new(n) { |i|
+        points[i].distance(points[(i + 1) % n]).to_f
+      }
+      cum = [0.0]
+      seg_lengths.each { |s| cum << cum.last + s }
+      total = cum.last
+
+      return points.dup if total < 1e-10
+
+      Array.new(target_count) do |k|
+        # k 番目の点を配置する目標弧長位置
+        target_dist = total * k.to_f / target_count
+
+        # 二分探索で対応セグメントを特定
+        seg_idx = binary_search_segment(cum, target_dist, n)
+
+        seg_len = seg_lengths[seg_idx]
+        if seg_len < 1e-10
+          points[seg_idx]
+        else
+          t = (target_dist - cum[seg_idx]) / seg_len
+          t = t.clamp(0.0, 1.0)
+          lerp_point(points[seg_idx], points[(seg_idx + 1) % n], t)
+        end
+      end
+    end
+
+    # 累積弧長配列 cum の中から target_dist を含むセグメントインデックスを二分探索で返す
+    def self.binary_search_segment(cum, target_dist, n)
+      lo = 0; hi = n - 1
+      while lo < hi
+        mid = (lo + hi) / 2
+        if cum[mid + 1] < target_dist
+          lo = mid + 1
+        else
+          hi = mid
+        end
+      end
+      lo
+    end
+
+    # 2点間の線形補間
+    def self.lerp_point(a, b, t)
+      Geom::Point3d.new(
+        a.x.to_f + t * (b.x.to_f - a.x.to_f),
+        a.y.to_f + t * (b.y.to_f - a.y.to_f),
+        a.z.to_f + t * (b.z.to_f - a.z.to_f)
+      )
+    end
+
+    # -------------------------------------------------------------------------
+    # Step 3: Rotation Alignment
+    # -------------------------------------------------------------------------
+
+    # pts_b を循環シフトしたときの pts_a との二乗距離合計を全シフト量で計算し、
+    # コストが最小になるシフト量（offset）を返す。
+    # 計算量: O(n²) — 実用的な頂点数（~数百）では十分高速。
+    #
+    # @param pts_a [Array<Geom::Point3d>]
+    # @param pts_b [Array<Geom::Point3d>] pts_a と同じ長さであること
+    # @return [Integer] 最適シフト量
+    def self.best_alignment_offset(pts_a, pts_b)
+      n           = pts_a.length
+      best_offset = 0
+      best_cost   = Float::INFINITY
+
+      n.times do |offset|
+        cost = 0.0
+        n.times do |i|
+          d = pts_a[i].distance(pts_b[(i + offset) % n]).to_f
+          cost += d * d
+        end
+        if cost < best_cost
+          best_cost   = cost
+          best_offset = offset
+        end
+      end
+
+      best_offset
+    end
+
+    # 配列を offset だけ循環シフトして返す
+    # （例: [A,B,C,D], offset=1 → [B,C,D,A]）
+    #
+    # @param arr    [Array]
+    # @param offset [Integer]
+    # @return [Array]
+    def self.rotate_array(arr, offset)
+      return arr.dup if arr.empty? || offset == 0
+      n      = arr.length
+      offset = offset % n
+      arr[offset..] + arr[0...offset]
+    end
+
+    # -------------------------------------------------------------------------
+    # Logging
+    # -------------------------------------------------------------------------
+
+    # ペアリング結果をコンソールに見やすく出力する
+    #
+    # @param pairs    [Array<Hash{a: Geom::Point3d, b: Geom::Point3d}>]
+    # @param n_a      [Integer] A の元の頂点数
+    # @param n_b      [Integer] B の元の頂点数
+    # @param target_n [Integer] リサンプリング後の統一頂点数
+    # @param offset   [Integer] 採用した B の循環シフト量
+    def self.log_pairs(pairs, n_a, n_b, target_n, offset)
+      puts ""
+      puts "===== [BridgeLoft Phase 2] Vertex Mapping Results ====="
+      puts ""
+      puts "  [Input]"
+      puts "    Component A vertices (original): #{n_a}"
+      puts "    Component B vertices (original): #{n_b}"
+      puts "    Unified count after resampling : #{target_n}"
+      puts "    Best alignment offset (B shift): #{offset}"
+      puts ""
+      puts "  [Pairs]  A[idx] position -> B[idx] position  (distance)"
+      puts "  " + "-" * 60
+
+      total_dist = 0.0
+      pairs.each_with_index do |pair, i|
+        a    = pair[:a]
+        b    = pair[:b]
+        dist = a.distance(b).to_f
+        total_dist += dist
+        puts format("  A[%3d] (%8.3f, %8.3f, %8.3f) ->" \
+                    " B[%3d] (%8.3f, %8.3f, %8.3f)  dist: %.4f\"",
+                    i, a.x.to_f, a.y.to_f, a.z.to_f,
+                    i, b.x.to_f, b.y.to_f, b.z.to_f,
+                    dist)
+      end
+
+      puts "  " + "-" * 60
+      avg_dist = total_dist / [pairs.length, 1].max
+      puts format("  Total distance: %.4f\"   Average per pair: %.4f\"",
+                  total_dist, avg_dist)
+      puts ""
+      puts "======================================================="
+      puts ""
+    end
+
+  end # module Phase2
+
 end # module SuBridgeLoft
 
-# スクリプトを直接 load した場合は即実行
-SuBridgeLoft::Phase1.extract_vertices
+# スクリプトを直接 load した場合は Phase 2 まで一括実行
+SuBridgeLoft::Phase2.run
