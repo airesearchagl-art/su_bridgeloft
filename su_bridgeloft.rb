@@ -9,8 +9,8 @@
 # [Development Phases]
 # Phase 1: 選択オブジェクトからの頂点データ（ワールド座標系）の抽出         [完了]
 # Phase 2: 頂点数が異なる場合の対応付け（マッピング/リサンプリング）ロジック [完了]
-# Phase 3: 補間（Tweening）による中間ジオメトリの生成とEntitiesへの描画     ← 現在
-# Phase 4: UI（入力ボックス）の実装とUndo管理（start_operation）の統合
+# Phase 3: 補間（Tweening）による中間ジオメトリの生成とEntitiesへの描画     [完了]
+# Phase 4: UI（メニュー・入力ボックス）・スムージング・マテリアル補間の統合  ← 現在
 #
 # [Phase 2 Algorithm Overview]
 # Step 1 - Angular Sort:
@@ -38,14 +38,25 @@
 #   隣接断面リング間の対応頂点をQuadで接続。非平面Quadは2つのTriに分割。
 #   これが Loft の「側面」= 真のサーフェスとなる。
 #
-# [Usage - Phase 3]
+# [Phase 4 Overview]
+# PluginUI モジュール:
+#   - Extensions > su_bridgeloft メニューを登録し、右クリックコンテキストにも追加する。
+#   - UI.inputbox で Steps を入力。前回値は Sketchup.read_default/write_default で永続化。
+#   - 選択バリデーションを行い、不正な場合は UI.messagebox でガイダンスを表示する。
+# Phase3 拡張:
+#   - smooth_skin: true  → loft_skin エッジを soft/smooth に設定して滑らかな外観にする。
+#   - interpolate_color: true + mat_a/mat_b → 断面グループに補間色マテリアルを適用する。
+#   - これらはすべて既存の start_operation 内で実行され、1 回の Undo で取り消せる。
+#
+# [Usage - Phase 4]
 # 1. SketchUp で2つの ComponentInstance を選択する
-# 2. Ruby コンソールで:
-#      load '/path/to/su_bridgeloft.rb'      # Phase 3 まで一括実行（steps=4）
-#    または
-#      SuBridgeLoft::Phase3.run(steps: 6)   # steps を指定
-#    または、pairs を直接渡す場合:
-#      SuBridgeLoft::Phase3.generate_morphs(pairs, steps: 4)
+# 2. Extensions > su_bridgeloft > Loft Between Components をクリック
+#    または右クリック > Run su_bridgeloft
+# 3. 表示されたダイアログで Steps を入力して OK
+#
+# [Console Usage]
+#      load '/path/to/su_bridgeloft.rb'
+#      SuBridgeLoft::Phase3.run(steps: 6)   # コンソールから直接実行
 #
 # =============================================================================
 
@@ -486,7 +497,8 @@ module SuBridgeLoft
     # Public API
     # -------------------------------------------------------------------------
 
-    # Phase 1 → 2 → 3 を一括実行するエントリポイント。
+    # Phase 1 → 2 → 3 を一括実行するエントリポイント（コンソール用）。
+    # PluginUI.execute とは異なり、マテリアル補間は行わない。
     #
     # @param steps [Integer] 中間断面の数（AとBは含まない）
     # @return [Array<Sketchup::Group>] 生成された断面グループの配列
@@ -494,7 +506,7 @@ module SuBridgeLoft
       pairs = Phase2.run
       return [] unless pairs && !pairs.empty?
 
-      generate_morphs(pairs, steps: steps)
+      generate_morphs(pairs, steps: steps, smooth_skin: true, interpolate_color: false)
     end
 
     # Phase 2 の pairs を受け取り、SketchUp 上に Loft ジオメトリを生成する。
@@ -507,10 +519,16 @@ module SuBridgeLoft
     #   ├── section_NN  (B断面 cap)
     #   └── loft_skin   (全側面 Quad/Tri)
     #
-    # @param pairs [Array<Hash{a: Geom::Point3d, b: Geom::Point3d}>]
-    # @param steps [Integer] 中間断面の数
+    # @param pairs             [Array<Hash{a: Geom::Point3d, b: Geom::Point3d}>]
+    # @param steps             [Integer] 中間断面の数（デフォルト: 4）
+    # @param smooth_skin       [Boolean] loft_skin エッジを soft/smooth に設定する
+    # @param interpolate_color [Boolean] 断面に補間マテリアルを適用する
+    # @param mat_a             [Sketchup::Material, nil] A 断面のマテリアル
+    # @param mat_b             [Sketchup::Material, nil] B 断面のマテリアル
     # @return [Array<Sketchup::Group>] 断面グループの配列（loft_skin は含まない）
-    def self.generate_morphs(pairs, steps: 4)
+    def self.generate_morphs(pairs, steps: 4,
+                             smooth_skin: true, interpolate_color: true,
+                             mat_a: nil, mat_b: nil)
       if pairs.empty?
         puts "[BridgeLoft] Error: pairs is empty. Aborting Phase 3."
         return []
@@ -526,7 +544,7 @@ module SuBridgeLoft
 
         # ---- Step 1: 全断面リングを生成 ----
         # sections[0] = A, sections[1..steps] = 中間, sections[steps+1] = B
-        sections = build_sections(pairs, steps)
+        sections       = build_sections(pairs, steps)
         total_sections = sections.length  # = steps + 2
 
         # ---- Step 2: 各断面に cap フェースを追加 ----
@@ -542,9 +560,18 @@ module SuBridgeLoft
         skin_group.name = 'loft_skin'
         faces_created   = stitch_sections(skin_group.entities, sections)
 
+        # ---- Step 4: Skin エッジのスムージング（オプション）----
+        apply_smooth_skin(skin_group) if smooth_skin
+
+        # ---- Step 5: 断面への補間マテリアル適用（オプション）----
+        if interpolate_color && mat_a && mat_b
+          apply_section_materials(model, section_groups, mat_a, mat_b)
+        end
+
         model.commit_operation
 
-        log_result(steps, total_sections, section_groups.length, faces_created)
+        log_result(steps, total_sections, section_groups.length,
+                   faces_created, smooth_skin, interpolate_color && mat_a && mat_b)
         section_groups
 
       rescue => e
@@ -700,22 +727,283 @@ module SuBridgeLoft
     # Logging
     # -------------------------------------------------------------------------
 
-    def self.log_result(steps, total_sections, n_section_groups, faces_created)
+    def self.log_result(steps, total_sections, n_section_groups,
+                        faces_created, smoothed, colored)
       puts ""
       puts "===== [BridgeLoft Phase 3] Geometry Generation Complete ====="
-      puts "  Intermediate steps     : #{steps}"
+      puts "  Intermediate steps      : #{steps}"
       puts "  Total sections (A+mid+B): #{total_sections}"
-      puts "  Section cap groups     : #{n_section_groups}"
-      puts "  Loft skin faces        : #{faces_created}"
-      puts "  Parent group           : '#{RESULT_GROUP_NAME}'"
+      puts "  Section cap groups      : #{n_section_groups}"
+      puts "  Loft skin faces         : #{faces_created}"
+      puts "  Edge smoothing applied  : #{smoothed}"
+      puts "  Material interpolation  : #{colored}"
+      puts "  Parent group            : '#{RESULT_GROUP_NAME}'"
       puts "  → Undo with Ctrl+Z to remove all generated geometry."
       puts "============================================================="
       puts ""
     end
 
+    # -------------------------------------------------------------------------
+    # Step 4: Edge Smoothing
+    # -------------------------------------------------------------------------
+
+    # loft_skin グループ内の全エッジを soft + smooth に設定する。
+    # これにより隣接フェース間の稜線が視覚的に消え、滑らかな曲面に見える。
+    #
+    # @param skin_group [Sketchup::Group]
+    def self.apply_smooth_skin(skin_group)
+      skin_group.entities.grep(Sketchup::Edge).each do |edge|
+        edge.soft   = true
+        edge.smooth = true
+      end
+    end
+
+    # -------------------------------------------------------------------------
+    # Step 5: Material Color Interpolation
+    # -------------------------------------------------------------------------
+
+    # 断面グループに A→B の補間色マテリアルを適用する。
+    # t = 0.0 (A断面) → t = 1.0 (B断面) で RGBA を線形補間する。
+    #
+    # @param model          [Sketchup::Model]
+    # @param section_groups [Array<Sketchup::Group>]
+    # @param mat_a          [Sketchup::Material]
+    # @param mat_b          [Sketchup::Material]
+    def self.apply_section_materials(model, section_groups, mat_a, mat_b)
+      # 既存の bridgeloft_sec_* マテリアルを削除して名前衝突を防ぐ
+      model.materials.purge_unused
+      stale = model.materials.select { |m| m.name.start_with?('bridgeloft_sec_') }
+      stale.each { |m| model.materials.remove(m) }
+
+      n = [section_groups.length - 1, 1].max
+      section_groups.each_with_index do |grp, i|
+        t     = i.to_f / n
+        color = lerp_color(mat_a.color, mat_b.color, t)
+        mat   = model.materials.add(format('bridgeloft_sec_%02d', i))
+        mat.color    = color
+        grp.material = mat
+      end
+    end
+
+    # 2色の RGBA 線形補間
+    #
+    # @param ca [Sketchup::Color]
+    # @param cb [Sketchup::Color]
+    # @param t  [Float] 0.0..1.0
+    # @return   [Sketchup::Color]
+    def self.lerp_color(ca, cb, t)
+      Sketchup::Color.new(
+        lerp_byte(ca.red,   cb.red,   t),
+        lerp_byte(ca.green, cb.green, t),
+        lerp_byte(ca.blue,  cb.blue,  t),
+        lerp_byte(ca.alpha, cb.alpha, t)
+      )
+    end
+
+    # 整数チャンネル値 (0-255) の線形補間
+    def self.lerp_byte(a, b, t)
+      (a + (b - a) * t).round.clamp(0, 255)
+    end
+
   end # module Phase3
+
+
+  # ===========================================================================
+  # Phase 4: Plugin UI（メニュー・ダイアログ・バリデーション）
+  # ===========================================================================
+  module PluginUI
+
+    # Sketchup.read_default / write_default で使用する名前空間キー
+    PLUGIN_ID     = 'su_bridgeloft'
+    DEFAULT_STEPS = 4
+
+    # -------------------------------------------------------------------------
+    # Menu Registration
+    # -------------------------------------------------------------------------
+
+    # Extensions メニューへの登録と右クリックハンドラの設定を行う。
+    # file_loaded? ガードにより、SketchUp セッション中に1回だけ呼ばれる。
+    def self.register_menus
+      # ---- Extensions > su_bridgeloft > Loft Between Components ----
+      ext_menu  = UI.menu('Extensions')
+      submenu   = ext_menu.add_submenu('su_bridgeloft')
+      submenu.add_item('Loft Between Components') { PluginUI.execute }
+      submenu.add_separator
+      submenu.add_item('About') {
+        UI.messagebox(
+          "su_bridgeloft v1.0.0\n" \
+          "Loft morphing between two ComponentInstances.\n\n" \
+          "Select 2 components, then run Loft Between Components.",
+          MB_OK
+        )
+      }
+
+      # ---- 右クリック コンテキストメニュー ----
+      # ハンドラは毎回の右クリックで実行されるが、メニュー項目の追加は
+      # 2つの ComponentInstance が選択されているときのみ行う。
+      UI.add_context_menu_handler do |ctx_menu|
+        sel       = Sketchup.active_model.selection
+        instances = sel.select { |e| e.is_a?(Sketchup::ComponentInstance) }
+        if instances.length >= 2
+          ctx_menu.add_separator
+          ctx_menu.add_item('Run su_bridgeloft') { PluginUI.execute }
+        end
+      end
+    end
+
+    # -------------------------------------------------------------------------
+    # Main Execution
+    # -------------------------------------------------------------------------
+
+    # プラグインのメイン実行フロー。
+    # バリデーション → Steps 入力 → 頂点抽出・マッピング → ジオメトリ生成。
+    def self.execute
+      # --- 1. 選択バリデーション ---
+      instances = validate_selection
+      return unless instances
+
+      # --- 2. Steps 入力ダイアログ ---
+      steps = ask_steps
+      return unless steps
+
+      inst_a, inst_b = instances
+
+      # --- 3. 頂点抽出（Phase 1）---
+      pts_a = Phase1.world_vertices(inst_a)
+      pts_b = Phase1.world_vertices(inst_b)
+
+      if pts_a.empty? || pts_b.empty?
+        UI.messagebox(
+          "Vertex extraction failed.\n" \
+          "Make sure the selected components contain geometry.",
+          MB_OK
+        )
+        return
+      end
+
+      # --- 4. 頂点マッピング（Phase 2）---
+      pairs = Phase2.map_vertices(pts_a, pts_b)
+      if pairs.empty?
+        UI.messagebox("Vertex mapping produced no pairs. Aborting.", MB_OK)
+        return
+      end
+
+      # --- 5. マテリアル解決 ---
+      mat_a = resolve_material(inst_a)
+      mat_b = resolve_material(inst_b)
+
+      # --- 6. ジオメトリ生成（Phase 3）---
+      Phase3.generate_morphs(
+        pairs,
+        steps:             steps,
+        smooth_skin:       true,
+        interpolate_color: !mat_a.nil? && !mat_b.nil?,
+        mat_a:             mat_a,
+        mat_b:             mat_b
+      )
+    end
+
+    # -------------------------------------------------------------------------
+    # Selection Validation
+    # -------------------------------------------------------------------------
+
+    # 現在の選択から2つの ComponentInstance を取得する。
+    # 不正な選択の場合は UI.messagebox でガイダンスを表示して nil を返す。
+    #
+    # @return [Array(Sketchup::ComponentInstance, Sketchup::ComponentInstance), nil]
+    def self.validate_selection
+      sel       = Sketchup.active_model.selection
+      instances = sel.select { |e| e.is_a?(Sketchup::ComponentInstance) }
+
+      if instances.length < 2
+        msg = if sel.empty?
+          "Nothing is selected.\n\nPlease select 2 ComponentInstances and try again."
+        else
+          "su_bridgeloft requires exactly 2 ComponentInstances.\n\n" \
+          "Currently selected : #{sel.length} entit#{sel.length == 1 ? 'y' : 'ies'}\n" \
+          "ComponentInstances : #{instances.length}"
+        end
+        UI.messagebox(msg, MB_OK)
+        return nil
+      end
+
+      if instances.length > 2
+        answer = UI.messagebox(
+          "#{instances.length} ComponentInstances are selected.\n\n" \
+          "su_bridgeloft will use the first two. Continue?",
+          MB_YESNO
+        )
+        return nil if answer == IDNO
+      end
+
+      instances.first(2)
+    end
+
+    # -------------------------------------------------------------------------
+    # Steps Input Dialog
+    # -------------------------------------------------------------------------
+
+    # UI.inputbox で Steps を入力させる。
+    # 前回の値を Sketchup.read_default から読み込み、入力後に write_default で保存する。
+    # キャンセル時は nil を返す。
+    #
+    # @return [Integer, nil]
+    def self.ask_steps
+      saved   = Sketchup.read_default(PLUGIN_ID, 'steps', DEFAULT_STEPS).to_i
+      saved   = DEFAULT_STEPS unless (1..100).include?(saved)
+
+      result  = UI.inputbox(
+        ['Intermediate sections (Steps, 1-100):'],
+        [saved],
+        'su_bridgeloft'
+      )
+      return nil unless result  # ユーザーがキャンセル
+
+      steps = result[0].to_i
+
+      unless (1..100).include?(steps)
+        UI.messagebox(
+          "Steps must be between 1 and 100.\n" \
+          "Entered value (#{result[0]}) was clamped to #{steps.clamp(1, 100)}.",
+          MB_OK
+        )
+        steps = steps.clamp(1, 100)
+      end
+
+      Sketchup.write_default(PLUGIN_ID, 'steps', steps)
+      steps
+    end
+
+    # -------------------------------------------------------------------------
+    # Material Resolution
+    # -------------------------------------------------------------------------
+
+    # ComponentInstance のマテリアルを解決する。
+    # インスタンス自体にマテリアルがなければ、定義内の最初の Face のマテリアルを探す。
+    #
+    # @param instance [Sketchup::ComponentInstance]
+    # @return [Sketchup::Material, nil]
+    def self.resolve_material(instance)
+      return instance.material if instance.material
+
+      instance.definition.entities.grep(Sketchup::Face).each do |face|
+        return face.material if face.material
+      end
+
+      nil
+    end
+
+  end # module PluginUI
 
 end # module SuBridgeLoft
 
-# スクリプトを直接 load した場合は Phase 3 まで一括実行（steps=4）
-SuBridgeLoft::Phase3.run(steps: 4)
+# =============================================================================
+# Bootstrap: メニュー登録（SketchUp 起動時に1回だけ実行）
+#
+# file_loaded? / file_loaded は SketchUp の拡張ローダーが提供するメソッド。
+# load で複数回読み込まれた場合でも、メニュー・ハンドラの多重登録を防ぐ。
+# =============================================================================
+unless file_loaded?(__FILE__)
+  SuBridgeLoft::PluginUI.register_menus
+  file_loaded(__FILE__)
+end
