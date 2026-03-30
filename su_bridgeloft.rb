@@ -8,13 +8,13 @@
 #
 # [Development Phases]
 # Phase 1: 選択オブジェクトからの頂点データ（ワールド座標系）の抽出         [完了]
-# Phase 2: 頂点数が異なる場合の対応付け（マッピング/リサンプリング）ロジック ← 現在
-# Phase 3: 補間（Tweening）による中間ジオメトリの生成とEntitiesへの描画
+# Phase 2: 頂点数が異なる場合の対応付け（マッピング/リサンプリング）ロジック [完了]
+# Phase 3: 補間（Tweening）による中間ジオメトリの生成とEntitiesへの描画     ← 現在
 # Phase 4: UI（入力ボックス）の実装とUndo管理（start_operation）の統合
 #
 # [Phase 2 Algorithm Overview]
 # Step 1 - Angular Sort:
-#   Newell法で点群の法線を推定し、重心まわりの角度で頂点を時計回りに整列する。
+#   Newell法で点群の法線を推定し、重心まわりの角度で頂点を反時計回りに整列する。
 #   これにより、頂点順序の不整合から生じるLoftの「ねじれ」を抑制する。
 #
 # Step 2 - Arc-length Resampling:
@@ -25,14 +25,27 @@
 #   B配列の循環シフト（回転オフセット）を全パターン試し、A との距離コストの
 #   合計が最小になるシフト量を採用する。これがLoftの「開始点」を揃える役割を担う。
 #
-# [Usage - Phase 2]
+# [Phase 3 Algorithm Overview]
+# Step 1 - build_sections:
+#   pairs と steps から (steps+2) 個の断面リングを線形補間で生成する。
+#   sections[0] = A断面、sections[steps+1] = B断面、間は均等補間。
+#
+# Step 2 - add_section_face (cap):
+#   各断面の頂点群から Face を生成。平面性が確保できない場合は重心から
+#   ファン三角化（fan triangulation）でフォールバックする。
+#
+# Step 3 - stitch_sections (loft skin):
+#   隣接断面リング間の対応頂点をQuadで接続。非平面Quadは2つのTriに分割。
+#   これが Loft の「側面」= 真のサーフェスとなる。
+#
+# [Usage - Phase 3]
 # 1. SketchUp で2つの ComponentInstance を選択する
 # 2. Ruby コンソールで:
-#      load '/path/to/su_bridgeloft.rb'
+#      load '/path/to/su_bridgeloft.rb'      # Phase 3 まで一括実行（steps=4）
 #    または
-#      SuBridgeLoft::Phase2.run
-#    または、直接頂点配列を渡す場合:
-#      pairs = SuBridgeLoft::Phase2.map_vertices(pts_a, pts_b)
+#      SuBridgeLoft::Phase3.run(steps: 6)   # steps を指定
+#    または、pairs を直接渡す場合:
+#      SuBridgeLoft::Phase3.generate_morphs(pairs, steps: 4)
 #
 # =============================================================================
 
@@ -460,7 +473,249 @@ module SuBridgeLoft
 
   end # module Phase2
 
+
+  # ===========================================================================
+  # Phase 3: 補間ジオメトリの生成（Morphing & Loft Skin）
+  # ===========================================================================
+  module Phase3
+
+    # 生成されるトップレベルグループの名前（既存があれば置き換える）
+    RESULT_GROUP_NAME = 'su_bridgeloft_result'
+
+    # -------------------------------------------------------------------------
+    # Public API
+    # -------------------------------------------------------------------------
+
+    # Phase 1 → 2 → 3 を一括実行するエントリポイント。
+    #
+    # @param steps [Integer] 中間断面の数（AとBは含まない）
+    # @return [Array<Sketchup::Group>] 生成された断面グループの配列
+    def self.run(steps: 4)
+      pairs = Phase2.run
+      return [] unless pairs && !pairs.empty?
+
+      generate_morphs(pairs, steps: steps)
+    end
+
+    # Phase 2 の pairs を受け取り、SketchUp 上に Loft ジオメトリを生成する。
+    #
+    # グループ構造:
+    #   su_bridgeloft_result (親グループ)
+    #   ├── section_00  (A断面 cap)
+    #   ├── section_01  (補間断面 cap)
+    #   │   ...
+    #   ├── section_NN  (B断面 cap)
+    #   └── loft_skin   (全側面 Quad/Tri)
+    #
+    # @param pairs [Array<Hash{a: Geom::Point3d, b: Geom::Point3d}>]
+    # @param steps [Integer] 中間断面の数
+    # @return [Array<Sketchup::Group>] 断面グループの配列（loft_skin は含まない）
+    def self.generate_morphs(pairs, steps: 4)
+      if pairs.empty?
+        puts "[BridgeLoft] Error: pairs is empty. Aborting Phase 3."
+        return []
+      end
+
+      model = Sketchup.active_model
+      model.start_operation('su_bridgeloft', true)
+
+      begin
+        # 親グループを取得（既存があれば削除して作り直す）
+        parent_group = reset_result_group(model.entities)
+        p_ents       = parent_group.entities
+
+        # ---- Step 1: 全断面リングを生成 ----
+        # sections[0] = A, sections[1..steps] = 中間, sections[steps+1] = B
+        sections = build_sections(pairs, steps)
+        total_sections = sections.length  # = steps + 2
+
+        # ---- Step 2: 各断面に cap フェースを追加 ----
+        section_groups = sections.map.with_index do |ring, idx|
+          grp      = p_ents.add_group
+          grp.name = format('section_%02d', idx)
+          add_section_face(grp.entities, ring)
+          grp
+        end
+
+        # ---- Step 3: 隣接断面間に側面（Loft Skin）を張る ----
+        skin_group      = p_ents.add_group
+        skin_group.name = 'loft_skin'
+        faces_created   = stitch_sections(skin_group.entities, sections)
+
+        model.commit_operation
+
+        log_result(steps, total_sections, section_groups.length, faces_created)
+        section_groups
+
+      rescue => e
+        model.abort_operation
+        puts "[BridgeLoft] Error in Phase 3: #{e.message}"
+        puts e.backtrace.first(5).join("\n")
+        []
+      end
+    end
+
+    # -------------------------------------------------------------------------
+    # Step 1: 断面リングの生成
+    # -------------------------------------------------------------------------
+
+    # pairs から (steps + 2) 個の断面リング配列を線形補間で構築する。
+    # t = 0.0 が A 断面、t = 1.0 が B 断面、間は均等分割。
+    #
+    # @param pairs [Array<Hash{a: Point3d, b: Point3d}>]
+    # @param steps [Integer]
+    # @return [Array<Array<Geom::Point3d>>] 断面ごとの頂点リスト
+    def self.build_sections(pairs, steps)
+      total = steps + 2  # A + 中間 + B
+
+      Array.new(total) do |s|
+        t = s.to_f / (total - 1)  # 0.0 ... 1.0
+        pairs.map { |pair| Phase2.lerp_point(pair[:a], pair[:b], t) }
+      end
+    end
+
+    # -------------------------------------------------------------------------
+    # Step 2: Cap フェースの追加
+    # -------------------------------------------------------------------------
+
+    # 断面の頂点リングから閉じた Face を生成する。
+    # 非平面の場合は重心からのファン三角化にフォールバックする。
+    #
+    # @param entities [Sketchup::Entities]
+    # @param ring     [Array<Geom::Point3d>]
+    def self.add_section_face(entities, ring)
+      return if ring.length < 3
+
+      # まず全頂点で単一フェースを試みる
+      return if try_add_face(entities, ring)
+
+      # フォールバック: 重心からファン三角化
+      cen = Phase2.centroid(ring)
+      n   = ring.length
+      n.times do |i|
+        try_add_face(entities, [cen, ring[i], ring[(i + 1) % n]])
+      end
+    end
+
+    # -------------------------------------------------------------------------
+    # Step 3: 側面（Loft Skin）の生成
+    # -------------------------------------------------------------------------
+
+    # 隣接する断面リングのペアに対して Quad 側面を張る。
+    # Quad が非平面の場合は2つの Triangle に分割する。
+    #
+    # Quad の頂点順序（外向き法線が一貫するよう右ねじ方向を維持）:
+    #   ring_prev[j] → ring_prev[j+1] → ring_next[j+1] → ring_next[j]
+    #
+    # @param entities [Sketchup::Entities]
+    # @param sections [Array<Array<Geom::Point3d>>]
+    # @return [Integer] 実際に生成されたフェース数
+    def self.stitch_sections(entities, sections)
+      n_pts        = sections[0].length
+      faces_count  = 0
+
+      sections.each_cons(2) do |ring_prev, ring_next|
+        n_pts.times do |j|
+          j1 = (j + 1) % n_pts
+
+          a = ring_prev[j]   # 現断面 左
+          b = ring_prev[j1]  # 現断面 右
+          c = ring_next[j1]  # 次断面 右
+          d = ring_next[j]   # 次断面 左
+
+          if try_add_face(entities, [a, b, c, d])
+            faces_count += 1
+          else
+            # Quad が縮退または非平面 → 2 Triangle に分割
+            faces_count += 1 if try_add_face(entities, [a, b, d])
+            faces_count += 1 if try_add_face(entities, [b, c, d])
+          end
+        end
+      end
+
+      faces_count
+    end
+
+    # -------------------------------------------------------------------------
+    # Geometry Utilities
+    # -------------------------------------------------------------------------
+
+    # Sketchup::Entities#add_face の安全ラッパー。
+    # 生成に失敗した場合（ArgumentError, 縮退, nil 返却）は nil を返す。
+    #
+    # @param entities [Sketchup::Entities]
+    # @param pts      [Array<Geom::Point3d>] 3点以上
+    # @return [Sketchup::Face, nil]
+    def self.try_add_face(entities, pts)
+      return nil if pts.length < 3
+
+      # 縮退チェック: 全点が同一または直線上にある場合はスキップ
+      return nil if degenerate_polygon?(pts)
+
+      begin
+        result = entities.add_face(pts)
+        result.is_a?(Sketchup::Face) ? result : nil
+      rescue ArgumentError, RuntimeError
+        nil
+      end
+    end
+
+    # 頂点リストが縮退しているか判定する（面積ゼロ = ゼロベクトルのクロス積）
+    #
+    # @param pts [Array<Geom::Point3d>]
+    # @return [Boolean]
+    def self.degenerate_polygon?(pts)
+      # 最初の非ゼロ辺ベクトルを基準に面積を推定
+      area2 = 0.0
+      origin = pts[0]
+      (2...pts.length).each do |i|
+        v1 = pts[i - 1] - origin
+        v2 = pts[i]     - origin
+        # クロス積の長さ = 平行四辺形面積
+        cx = v1.y.to_f * v2.z.to_f - v1.z.to_f * v2.y.to_f
+        cy = v1.z.to_f * v2.x.to_f - v1.x.to_f * v2.z.to_f
+        cz = v1.x.to_f * v2.y.to_f - v1.y.to_f * v2.x.to_f
+        area2 += Math.sqrt(cx * cx + cy * cy + cz * cz)
+      end
+      area2 < TOLERANCE
+    end
+
+    # 既存の結果グループを削除して新しいグループを返す
+    #
+    # @param entities [Sketchup::Entities] model.entities
+    # @return [Sketchup::Group]
+    def self.reset_result_group(entities)
+      existing = entities.grep(Sketchup::Group)
+                         .select { |g| g.name == RESULT_GROUP_NAME }
+      unless existing.empty?
+        puts "[BridgeLoft] Replacing existing '#{RESULT_GROUP_NAME}' group."
+        entities.erase_entities(existing)
+      end
+      grp      = entities.add_group
+      grp.name = RESULT_GROUP_NAME
+      grp
+    end
+
+    # -------------------------------------------------------------------------
+    # Logging
+    # -------------------------------------------------------------------------
+
+    def self.log_result(steps, total_sections, n_section_groups, faces_created)
+      puts ""
+      puts "===== [BridgeLoft Phase 3] Geometry Generation Complete ====="
+      puts "  Intermediate steps     : #{steps}"
+      puts "  Total sections (A+mid+B): #{total_sections}"
+      puts "  Section cap groups     : #{n_section_groups}"
+      puts "  Loft skin faces        : #{faces_created}"
+      puts "  Parent group           : '#{RESULT_GROUP_NAME}'"
+      puts "  → Undo with Ctrl+Z to remove all generated geometry."
+      puts "============================================================="
+      puts ""
+    end
+
+  end # module Phase3
+
 end # module SuBridgeLoft
 
-# スクリプトを直接 load した場合は Phase 2 まで一括実行
-SuBridgeLoft::Phase2.run
+# スクリプトを直接 load した場合は Phase 3 まで一括実行（steps=4）
+SuBridgeLoft::Phase3.run(steps: 4)
